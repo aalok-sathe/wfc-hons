@@ -1,0 +1,3 @@
+[submodule "transformers_root"]
+	path = transformers_root
+	url = https://github.com/huggingface/transformers
