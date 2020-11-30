@@ -43,14 +43,15 @@ def main():
     
     parser.add_argument('--num_epochs', type=int, default=1)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--save_steps', type=int, default=500)
-    parser.add_argument('--eval_steps', type=int, default=50)
-    parser.add_argument('--logging_steps', type=int, default=50)
+    parser.add_argument('--learning_rate', type=float, default=1e-5)
+    parser.add_argument('--save_steps', type=int, default=10_000)
+    parser.add_argument('--eval_steps', type=int, default=1_000)
+    parser.add_argument('--logging_steps', type=int, default=500)
     parser.add_argument('--num_data_files', type=int, default=None)
     
     parser.add_argument('--overwrite_cache', action='store_true')
     
-    parser.add_argument('--train_size', type=float, default=.8)
+#     parser.add_argument('--train_size', type=float, default=.8)
     parser.add_argument('--data_dir', type=str, default='./utf-refdata')
     
     args = parser.parse_args()
@@ -124,18 +125,22 @@ def main():
     )
     
     training_args = TrainingArguments(
-        output_dir="./wfclm",
+        output_dir=f"./wfclm/{args.model_class}_{args.num_data_files}_lr={args.learning_rate}",
         overwrite_output_dir=True,
         do_train=True, #do_eval=True, evaluate_during_training=True,
         
+        dataloader_num_workers=4,
+        
         num_train_epochs=args.num_epochs,
-        per_gpu_train_batch_size=args.batch_size,
+        per_device_train_batch_size=args.batch_size,
         
         logging_steps=args.logging_steps,
         logging_first_step=True,
         
         save_steps=args.save_steps,
         save_total_limit=5,
+        
+        learning_rate=args.learning_rate,
         
 #         eval_steps=args.eval_steps,
 #         evaluation_strategy='steps'
@@ -145,7 +150,7 @@ def main():
         model=model,
         args=training_args,
         data_collator=data_collator,
-#         tokenizer=tokenizer,
+        tokenizer=tokenizer,
         train_dataset=dataset['train'],
 #         eval_dataset=split['test'],
 #         prediction_loss_only=True,
