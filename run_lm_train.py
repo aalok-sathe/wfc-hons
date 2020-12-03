@@ -98,7 +98,8 @@ def main():
     )
     
     model = model_class(config=config).cuda()
-    print(f'{model_class} model num params:', model.num_parameters())
+    print(f'{T.bold_yellow_on_black("INFO:")} {model_class} model num params:', 
+          model.num_parameters())
     
     train = pd.read_csv(f'{args.data_dir}/wfc_train.tsv', sep='\t')
     dev = pd.read_csv(f'{args.data_dir}/wfc_dev.tsv', sep='\t')
@@ -112,22 +113,27 @@ def main():
     random.seed(3142)
     random.shuffle(reffiles)
     
-    print(f'found records for {len(train)} evidence files in the train set')
-    print(f'retaining records for {len(reffiles)} evidence files in the train set')
-    print(f'found records for {len(dev_reffiles)} evidence files in the dev set')
+    print(f'{T.bold_yellow_on_black("INFO:")}',
+          f'found records for {len(train)} evidence files in the train set')
+    print(f'{T.bold_yellow_on_black("INFO:")}',
+          f'retaining records for {len(reffiles)} evidence files in the train set')
+    print(f'{T.bold_yellow_on_black("INFO:")}',
+          f'found records for {len(dev_reffiles)} evidence files in the dev set')
 
     saved = Path(f'{args.cache_dir}/datasets/{args.num_data_files}_encoded.dat')
     saved_dev = Path(f'{args.cache_dir}/datasets/{args.num_data_files}_encoded_dev.dat')
     if saved.exists() and not args.overwrite_cache:
+        print(f'{T.bold_yellow_on_black("INFO:")} loading saved data from {saved}')
         dataset = datasets.load_from_disk(str(saved))
         dev_dataset = datasets.load_from_disk(str(saved_dev))
     else:
+        print(f'{T.bold_yellow_on_black("INFO:")} saved data not found at {saved}')
         dataset = datasets.load_dataset('text', 
                                         data_files=reffiles[:],
-                                        cache_dir=args.cache_dir)
+                                        cache_dir='/dev/null')
         dev_dataset = datasets.load_dataset('text', 
-                                        data_files=dev_reffiles[:],
-                                        cache_dir=args.cache_dir)
+                                            data_files=dev_reffiles[:],
+                                            cache_dir='/dev/null')
     
         def tokenize(e):
             return tokenizer(e['text'], truncation=True, padding=True)
@@ -135,6 +141,8 @@ def main():
         dataset = dataset.map(tokenize, batched=True)
         dev_dataset = dev_dataset.map(tokenize, batched=True)
         
+        print(f'{T.bold_yellow_on_black("INFO:")} saving tokenized data to {saved}')
+    
         dataset.save_to_disk(f'{args.cache_dir}/datasets/{args.num_data_files}_encoded.dat')
         dev_dataset.save_to_disk(f'{args.cache_dir}/datasets/{args.num_data_files}_encoded_dev.dat')
     
@@ -146,7 +154,9 @@ def main():
         tokenizer=tokenizer, mlm=True, mlm_probability=0.15
     )
     
+    
     out_dir = f"./{args.out_dir}/{args.model_class}_{args.num_data_files}_lr={args.learning_rate}"
+    print(f'{T.bold_yellow_on_black("INFO:")} output directory set to {out_dir}')
             
     training_args = TrainingArguments(
         output_dir=out_dir,
@@ -183,9 +193,12 @@ def main():
     try:
         trainer.train()
     except KeyboardInterrupt as k:
-        print('INFO: training aborted by user')
+        print(f'{T.bold_yellow_on_black("INFO:")}',
+              f'training aborted by user')
         
     with open(out_dir + '/' + 'files_used.yml', 'w+') as f:
-        print(*reffiles, sep='\n', file=f)
+        yaml.dump(reffiles, f)
+    print(f'{T.bold_yellow_on_black("INFO:")} saved list of evidence files used')
+    
     
 main()
