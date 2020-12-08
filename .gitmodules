@@ -1,6 +1,6 @@
 [submodule "transformers_root"]
 	path = transformers_root
-	url = https://github.com/huggingface/transformers
+	url = https://github.com/aalok-sathe/wfc-transformers
 [submodule "data"]
 	path = data
 	url = https://github.com/wikifactcheck-english/wikifactcheck-english
