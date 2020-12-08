@@ -37,11 +37,13 @@ from transformers import (
     AutoTokenizer,
     get_linear_schedule_with_warmup,
 )
-from transformers import glue_convert_examples_to_features as convert_examples_to_features
+# from transformers import glue_convert_examples_to_features as convert_examples_to_features
 from transformers import xnli_compute_metrics as compute_metrics
 from transformers import xnli_output_modes as output_modes
 # from transformers import xnli_processors as processors
-from data.wfc_processors as processors
+
+from datasets import load_dataset, load_from_disk
+#from data.wfc_processor import wfc_processors as processors
 
 
 try:
