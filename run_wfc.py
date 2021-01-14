@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # coding=utf-8
 # Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
 # Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
@@ -36,15 +37,22 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     get_linear_schedule_with_warmup,
+    #
+    
 )
-# from transformers import glue_convert_examples_to_features as convert_examples_to_features
+from transformers import glue_convert_examples_to_features as convert_examples_to_features
 from transformers import xnli_compute_metrics as compute_metrics
-from transformers import xnli_output_modes as output_modes
+# from transformers import xnli_output_modes as output_modes
 # from transformers import xnli_processors as processors
 
 from datasets import load_dataset, load_from_disk
-#from data.wfc_processor import wfc_processors as processors
+from data.wfc_processor import wfc_processors as processors
+from data.wfc_processor import wfc_output_modes as output_modes
+from data.wfc_processor import wfc_convert_examples_to_features
 
+
+from colorama import Fore, Back, Style
+from blessings import Terminal; T = Terminal()
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -70,8 +78,11 @@ def train(args, train_dataset, model, tokenizer):
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
-
+    #!
+    ##############################
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=1 or args.train_batch_size)
+    ##############################
+    
     if args.max_steps > 0:
         t_total = args.max_steps
         args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
@@ -100,7 +111,7 @@ def train(args, train_dataset, model, tokenizer):
         optimizer.load_state_dict(torch.load(os.path.join(args.model_name_or_path, "optimizer.pt")))
         scheduler.load_state_dict(torch.load(os.path.join(args.model_name_or_path, "scheduler.pt")))
 
-    if args.fp16:
+    if False or args.fp16:
         try:
             from apex import amp
         except ImportError:
@@ -159,31 +170,56 @@ def train(args, train_dataset, model, tokenizer):
             if steps_trained_in_current_epoch > 0:
                 steps_trained_in_current_epoch -= 1
                 continue
+            #                                                         1, |E|, 768
+            print(f'{T.bold_yellow_on_black("INFO:")} batch length: {(batch[0].size())}')
+            if step >= 10: raise
+                
+            instance_outputs = []
+                
+            minibatch_size = args.batch_size
+            for j in range(0, batch[0].shape[1], minibatch_size):
+                limits = slice(j, min(j+minibatch_size, batch[0].shape[1]))
+                    
+                minibatch = tuple(t[limits] for t in batch)
+                    
+                model.train()
+                # batch = tuple(t.to(args.device) for t in batch) # contains *one* claim
+                inputs = {"input_ids": minibatch[0].view(-1, 128).to(args.device), 
+                          "attention_mask": minibatch[1].view(-1, 128).to(args.device), 
+                          "labels": minibatch[3].view(-1, 1).to(args.device)
+                         }
+            
+            ####
+            # print(inputs)
+            
+#             if args.model_type != "distilbert":
+#                 inputs["token_type_ids"] = (
+#                     batch[2] if args.model_type in ["bert"] else None
+#                 )  # XLM and DistilBERT don't use segment_ids
+                outputs = model(**inputs)
+                print(f'{T.bold_yellow_on_black("INFO:")} output shape: {(outputs.shape)}')
+        
+                instance_outputs += outputs[1] # labels dim?
+        
+                loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
 
-            model.train()
-            batch = tuple(t.to(args.device) for t in batch)
-            inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
-            if args.model_type != "distilbert":
-                inputs["token_type_ids"] = (
-                    batch[2] if args.model_type in ["bert"] else None
-                )  # XLM and DistilBERT don't use segment_ids
-            outputs = model(**inputs)
-            loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+                raise
+            
+                if args.n_gpu > 1:
+                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
 
-            if args.n_gpu > 1:
-                loss = loss.mean()  # mean() to average on multi-gpu parallel training
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+                if False or args.fp16:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
 
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
-
-            tr_loss += loss.item()
+                tr_loss += loss.item()
+                
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                if args.fp16:
+                if False or args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -308,17 +344,18 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
-    processor = processors[task](language=args.language, train_language=args.train_language)
+    processor = processors[task]()
+        #(language=args.language, train_language=args.train_language)
     output_mode = output_modes[task]
     # Load data features from cache or dataset file
     cached_features_file = os.path.join(
-        args.data_dir,
-        "cached_{}_{}_{}_{}_{}".format(
+        args.cache_dir,
+        "cached_{}_{}_{}_{}".format(
             "test" if evaluate else "train",
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
             str(args.max_seq_length),
             str(task),
-            str(args.train_language if (not evaluate and args.train_language is not None) else args.language),
+#             str(args.train_language if (not evaluate and args.train_language is not None) else args.language),
         ),
     )
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
@@ -330,13 +367,13 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         examples = (
             processor.get_test_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
         )
-        features = convert_examples_to_features(
+        features = wfc_convert_examples_to_features(
             examples,
             tokenizer,
             max_length=args.max_seq_length,
             label_list=label_list,
             output_mode=output_mode,
-        )
+        ) # -> list of (list of features with text_a=claim, text_b=ith evidence sentence)
         if args.local_rank in [-1, 0]:
             logger.info("Saving features into cached file %s", cached_features_file)
             torch.save(features, cached_features_file)
@@ -345,16 +382,27 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
     # Convert to Tensors and build dataset
-    all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
-    all_attention_mask = torch.tensor([f.attention_mask for f in features], dtype=torch.long)
-    all_token_type_ids = torch.tensor([f.token_type_ids for f in features], dtype=torch.long)
+    all_input_ids = [torch.tensor([f.input_ids for f in inst], dtype=torch.long) 
+                     for inst in features] # each 'inst' is a claim,evidence example
+    all_attention_mask = [torch.tensor([f.attention_mask for f in inst], dtype=torch.long) 
+                          for inst in features]
+    all_token_type_ids = [torch.tensor([f.token_type_ids for f in inst], dtype=torch.long) 
+                          for inst in features]
     if output_mode == "classification":
-        all_labels = torch.tensor([f.label for f in features], dtype=torch.long)
+        all_labels = [torch.tensor([f.label for f in inst], dtype=torch.long) 
+                      for inst in features]
     else:
         raise ValueError("No other `output_mode` for XNLI.")
 
-    dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
-    return dataset
+#     dataset = TensorDataset(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)
+#     return dataset
+
+    return [*zip(all_input_ids, all_attention_mask, all_token_type_ids, all_labels)]
+    ##############
+        
+#     dataset = map(lambda tup: TensorDataset(*tup), 
+#                   zip(all_input_ids, all_attention_mask, all_token_type_ids, all_labels))
+#     return list(dataset)
 
 
 def main():
@@ -363,9 +411,9 @@ def main():
     # Required parameters
     parser.add_argument(
         "--data_dir",
-        default=None,
+        default='./data',
         type=str,
-        required=True,
+#         required=True,
         help="The input data dir. Should contain the .tsv files (or other data files) for the task.",
     )
     parser.add_argument(
@@ -375,21 +423,21 @@ def main():
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models",
     )
-    parser.add_argument(
-        "--language",
-        default=None,
-        type=str,
-        required=True,
-        help="Evaluation language. Also train language if `train_language` is set to None.",
-    )
-    parser.add_argument(
-        "--train_language", default=None, type=str, help="Train language if is different of the evaluation language."
-    )
+#     parser.add_argument(
+#         "--language",
+#         default=None,
+#         type=str,
+#         required=True,
+#         help="Evaluation language. Also train language if `train_language` is set to None.",
+#     )
+#     parser.add_argument(
+#         "--train_language", default=None, type=str, help="Train language if is different of the evaluation language."
+#     )
     parser.add_argument(
         "--output_dir",
-        default=None,
+        default='out',
         type=str,
-        required=True,
+        required=False,
         help="The output directory where the model predictions and checkpoints will be written.",
     )
 
@@ -405,7 +453,7 @@ def main():
     )
     parser.add_argument(
         "--cache_dir",
-        default=None,
+        default='/sw/mcs/wfc',
         type=str,
         help="Where do you want to store the pre-trained models downloaded from s3",
     )
@@ -422,9 +470,10 @@ def main():
         "--evaluate_during_training", action="store_true", help="Rul evaluation during training at each logging step."
     )
     parser.add_argument(
-        "--do_lower_case", action="store_true", help="Set this flag if you are using an uncased model."
+        "--do_lower_case", default=True, help="(def. True) unset this using 'False' if using uncased model."
     )
 
+    parser.add_argument("--batch_size", default=8, type=int, help="Batch size")
     parser.add_argument("--per_gpu_train_batch_size", default=8, type=int, help="Batch size per GPU/CPU for training.")
     parser.add_argument(
         "--per_gpu_eval_batch_size", default=8, type=int, help="Batch size per GPU/CPU for evaluation."
@@ -479,8 +528,8 @@ def main():
         "See details at https://nvidia.github.io/apex/amp.html",
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
-    parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
+#     parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
+#     parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
     args = parser.parse_args()
 
     if (
@@ -496,13 +545,13 @@ def main():
         )
 
     # Setup distant debugging if needed
-    if args.server_ip and args.server_port:
-        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
-        import ptvsd
+#     if args.server_ip and args.server_port:
+#         # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
+#         import ptvsd
 
-        print("Waiting for debugger attach")
-        ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
-        ptvsd.wait_for_attach()
+#         print("Waiting for debugger attach")
+#         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
+#         ptvsd.wait_for_attach()
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
@@ -523,21 +572,17 @@ def main():
     )
     logger.warning(
         "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-        args.local_rank,
-        device,
-        args.n_gpu,
-        bool(args.local_rank != -1),
-        args.fp16,
+        args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16,
     )
 
     # Set seed
     set_seed(args)
 
-    # Prepare XNLI task
-    args.task_name = "xnli"
+    # Prepare WFC task
+    args.task_name = "wfc"
     if args.task_name not in processors:
         raise ValueError("Task not found: %s" % (args.task_name))
-    processor = processors[args.task_name](language=args.language, train_language=args.train_language)
+    processor = processors[args.task_name]()
     args.output_mode = output_modes[args.task_name]
     label_list = processor.get_labels()
     num_labels = len(label_list)
@@ -558,6 +603,7 @@ def main():
         do_lower_case=args.do_lower_case,
         cache_dir=args.cache_dir,
     )
+#     model = AutoModelForSequenceClassification.from_pretrained(
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model_name_or_path,
         from_tf=bool(".ckpt" in args.model_name_or_path),
