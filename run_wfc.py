@@ -17,6 +17,7 @@
 """ Finetuning multi-lingual models on XNLI (e.g. Bert, DistilBERT, XLM).
     Adapted from `examples/text-classification/run_glue.py`"""
 
+import pdb
 
 import argparse
 import glob
@@ -28,6 +29,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 from torch.utils.data.distributed import DistributedSampler
+# from torch import linalg as LA
 from tqdm import tqdm, trange
 
 from transformers import (
@@ -35,10 +37,10 @@ from transformers import (
     AdamW,
     AutoConfig,
     AutoModelForSequenceClassification,
+    BertForFactChecking,
     AutoTokenizer,
     get_linear_schedule_with_warmup,
     #
-    
 )
 from transformers import glue_convert_examples_to_features as convert_examples_to_features
 from transformers import xnli_compute_metrics as compute_metrics
@@ -50,6 +52,7 @@ from data.wfc_processor import wfc_processors as processors
 from data.wfc_processor import wfc_output_modes as output_modes
 from data.wfc_processor import wfc_convert_examples_to_features
 
+from sentence_transformers import CrossEncoder, SentenceTransformer, util
 
 from colorama import Fore, Back, Style
 from blessings import Terminal; T = Terminal()
@@ -71,7 +74,10 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def train(args, train_dataset, model, tokenizer):
+################################################################################
+######## begin TRAIN FUNCTION ##################################################
+################################################################################
+def train(args, train_dataset, model, tokenizer, sbert=None, config=None):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         tb_writer = SummaryWriter()
@@ -82,7 +88,9 @@ def train(args, train_dataset, model, tokenizer):
     ##############################
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=1 or args.train_batch_size)
     ##############################
-    
+    print("LEN train data", len([*train_dataloader]))
+#     return None, None
+        
     if args.max_steps > 0:
         t_total = args.max_steps
         args.num_train_epochs = args.max_steps // (len(train_dataloader) // args.gradient_accumulation_steps) + 1
@@ -96,7 +104,8 @@ def train(args, train_dataset, model, tokenizer):
             "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
             "weight_decay": args.weight_decay,
         },
-        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
+        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 
+         "weight_decay": 0.0},
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     scheduler = get_linear_schedule_with_warmup(
@@ -111,7 +120,7 @@ def train(args, train_dataset, model, tokenizer):
         optimizer.load_state_dict(torch.load(os.path.join(args.model_name_or_path, "optimizer.pt")))
         scheduler.load_state_dict(torch.load(os.path.join(args.model_name_or_path, "scheduler.pt")))
 
-    if False or args.fp16:
+    if args.fp16:
         try:
             from apex import amp
         except ImportError:
@@ -121,7 +130,7 @@ def train(args, train_dataset, model, tokenizer):
     # multi-gpu training (should be after apex fp16 initialization)
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
-
+    
     # Distributed training (should be after apex fp16 initialization)
     if args.local_rank != -1:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -163,60 +172,83 @@ def train(args, train_dataset, model, tokenizer):
         epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
     )
     set_seed(args)  # Added here for reproductibility
-    for _ in train_iterator:
+    
+    ############################################################################
+    ######## train L00p ########################################################
+    
+    # total epochs loop
+    for epoch_number in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
+
+        torch.autograd.set_detect_anomaly(True)
+        # batches within an epoch loop
         for step, batch in enumerate(epoch_iterator):
+        
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
                 steps_trained_in_current_epoch -= 1
                 continue
             #                                                         1, |E|, 768
-            print(f'{T.bold_yellow_on_black("INFO:")} batch length: {(batch[0].size())}')
-            if step >= 10: raise
+            #print(f'{T.bold_yellow_on_black("INFO:")} batch length: {(batch[0].size())}\r', end='')
+            
+            #### TODO here for DEBUGGING purposes
+            #if step >= 10: raise
                 
+            attentions = []
             instance_outputs = []
+            hidden_states = []
+            instance_label = None
+            
+            running_logits = [] #torch.zeros(size=(1,2)).to(args.device)
                 
-            minibatch_size = args.batch_size
-            for j in range(0, batch[0].shape[1], minibatch_size):
-                limits = slice(j, min(j+minibatch_size, batch[0].shape[1]))
-                    
-                minibatch = tuple(t[limits] for t in batch)
-                    
-                model.train()
-                # batch = tuple(t.to(args.device) for t in batch) # contains *one* claim
-                inputs = {"input_ids": minibatch[0].view(-1, 128).to(args.device), 
-                          "attention_mask": minibatch[1].view(-1, 128).to(args.device), 
-                          "labels": minibatch[3].view(-1, 1).to(args.device)
-                         }
+            ######## batched loop
+#             minibatch_size = args.batch_size
+#             for j in range(0, batch[0].shape[1], minibatch_size):
+#                 limits = slice(j, min(j+minibatch_size, batch[0].shape[1]))
+                
+#                 print(f'batch contains: {[t.shape for t in batch]}')
+#                 minibatch = tuple(t[:, limits] for t in batch)
             
-            ####
-            # print(inputs)
+            #!!!!!!
+            minibatch = batch
+#                 print(f'{T.bold_yellow_on_black("Minibatch shape:")} {minibatch[0].shape}')
+
+            model.train()
+            # batch = tuple(t.to(args.device) for t in batch) # contains *one* claim
+
+            labels = minibatch[3].view(-1, 1).to(args.device)
+            inputs = {"input_ids": minibatch[0].view(-1, 128).to(args.device), 
+                      "attention_mask": minibatch[1].view(-1, 128).to(args.device), 
+#                           "labels": labels,
+                     }
             
-#             if args.model_type != "distilbert":
-#                 inputs["token_type_ids"] = (
-#                     batch[2] if args.model_type in ["bert"] else None
-#                 )  # XLM and DistilBERT don't use segment_ids
-                outputs = model(**inputs)
-                print(f'{T.bold_yellow_on_black("INFO:")} output shape: {(outputs.shape)}')
-        
-                instance_outputs += outputs[1] # labels dim?
-        
-                loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+            outputs = model(**inputs, output_hidden_states=True)
+            # b,2   b,1   12,b,n,768
+            logits, attn, hidden = outputs[:3] # model outputs are always tuple in transformers
+            # CLS = hidden[-1][:, 0, :]
 
-                raise
-            
-                if args.n_gpu > 1:
-                    loss = loss.mean()  # mean() to average on multi-gpu parallel training
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
+            weighted = logits * attn.view(-1, 1)
+            logits = torch.sum(weighted, dim=0)
+                
+            instance_label = labels[0]
+                            
+            loss_fct = torch.nn.functional.cross_entropy
+            loss = loss_fct(logits.view(-1, 2), instance_label.view(-1))
+    
+#             pdb.set_trace()
+                
+            if args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            if args.gradient_accumulation_steps > 1:
+                loss = loss / args.gradient_accumulation_steps
 
-                if False or args.fp16:
-                    with amp.scale_loss(loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                else:
-                    loss.backward()
+            if False or args.fp16:
+                with amp.scale_loss(loss, optimizer) as scaled_loss:
+                    scaled_loss.backward()
+            else:
+                loss.backward()
 
-                tr_loss += loss.item()
+            tr_loss += loss.item()
                 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if False or args.fp16:
@@ -239,7 +271,9 @@ def train(args, train_dataset, model, tokenizer):
                             tb_writer.add_scalar("eval_{}".format(key), value, global_step)
                     tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar("loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
+                    logger.info("Train logging loss %.3f", (tr_loss - logging_loss) / args.logging_steps)
                     logging_loss = tr_loss
+                                       
 
                 if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
                     # Save model checkpoint
@@ -271,6 +305,16 @@ def train(args, train_dataset, model, tokenizer):
 
     return global_step, tr_loss / global_step
 
+################################################################################
+######## end TRAIN FUNCTION ####################################################
+################################################################################
+
+
+
+
+################################################################################
+######## begin EVAL FUNCTION ###################################################
+################################################################################
 
 def evaluate(args, model, tokenizer, prefix=""):
     eval_task_names = (args.task_name,)
@@ -286,8 +330,11 @@ def evaluate(args, model, tokenizer, prefix=""):
         args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
         # Note that DistributedSampler samples randomly
         eval_sampler = SequentialSampler(eval_dataset)
-        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=1 or args.eval_batch_size)
 
+        [*eval_dataloader]
+#         return {"None": None}
+    
         # multi-gpu eval
         if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
             model = torch.nn.DataParallel(model)
@@ -302,31 +349,49 @@ def evaluate(args, model, tokenizer, prefix=""):
         out_label_ids = None
         for batch in tqdm(eval_dataloader, desc="Evaluating"):
             model.eval()
-            batch = tuple(t.to(args.device) for t in batch)
+            # batch = tuple(t.to(args.device) for t in batch)
 
             with torch.no_grad():
-                inputs = {"input_ids": batch[0], "attention_mask": batch[1], "labels": batch[3]}
-                if args.model_type != "distilbert":
-                    inputs["token_type_ids"] = (
-                        batch[2] if args.model_type in ["bert"] else None
-                    )  # XLM and DistilBERT don't use segment_ids
-                outputs = model(**inputs)
-                tmp_eval_loss, logits = outputs[:2]
+                labels = batch[3].view(-1, 1).to(args.device); instance_label = labels[0]
+                
+                inputs = {"input_ids": batch[0].view(-1, 128).to(args.device), 
+                          "attention_mask": batch[1].view(-1, 128).to(args.device), 
+#                           "labels": batch[3].view(-1, 1).to(args.device),
+                         }
+#                 if args.model_type != "distilbert":
+#                     inputs["token_type_ids"] = (
+#                         batch[2] if args.model_type in ["bert"] else None
+#                     )  # XLM and DistilBERT don't use segment_ids
+                outputs = model(**inputs, output_hidden_states=True)
+                
+#                 pdb.set_trace()
+                logits, attn, hidden = outputs[:3] # model outputs are always tuple in transformers (see doc)
+                CLS = hidden[-1][:, 0, :]
+            
+                weighted = logits * (attn ).view(-1, 1)
+                logits = torch.sum(weighted, dim=0)
+            
+                loss_fct = torch.nn.functional.cross_entropy
+                tmp_eval_loss = loss_fct(logits.view(-1, 2), instance_label.view(-1))
 
-                eval_loss += tmp_eval_loss.mean().item()
+                eval_loss = eval_loss + tmp_eval_loss.mean().item()
             nb_eval_steps += 1
+            
+            
             if preds is None:
-                preds = logits.detach().cpu().numpy()
-                out_label_ids = inputs["labels"].detach().cpu().numpy()
+                preds = logits.detach().cpu().view(1,-1).numpy()
+                out_label_ids = labels.detach().cpu()[0].view(1,-1).numpy()
             else:
-                preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
-                out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
+                preds = np.append(preds, logits.detach().cpu().view(1,-1).numpy(), axis=0)
+                out_label_ids = np.append(out_label_ids, labels.detach().cpu()[0].view(1,-1).numpy(), axis=0)
+
+        pdb.set_trace()
 
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode == "classification":
             preds = np.argmax(preds, axis=1)
         else:
-            raise ValueError("No other `output_mode` for XNLI.")
+            raise ValueError("No other `output_mode` for WFC-en.")
         result = compute_metrics(eval_task, preds, out_label_ids)
         results.update(result)
 
@@ -337,25 +402,45 @@ def evaluate(args, model, tokenizer, prefix=""):
                 logger.info("  %s = %s", key, str(result[key]))
                 writer.write("%s = %s\n" % (key, str(result[key])))
 
+    pdb.set_trace()            
+    
     return results
 
+################################################################################
+######## end EVAL FUNCTION #####################################################
+################################################################################
 
-def load_and_cache_examples(args, task, tokenizer, evaluate=False):
+
+
+################################################################################
+######## begin CACHE FUNCTION ##################################################
+################################################################################
+def load_and_cache_examples(args, task, tokenizer, evaluate=False, sbert_model_name_or_path:str=None):
+    '''
+        sbert: string model name to pass to sentence_transformers.CrossEncoder
+            this instance will be used to rank sentences in the evidence file by similarity
+    '''
     if args.local_rank not in [-1, 0] and not evaluate:
         torch.distributed.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
+    if sbert_model_name_or_path is None:
+        sbert = CrossEncoder('cross-encoder/stsb-roberta-large', device=args.device)
+    else:
+        sbert = CrossEncoder(sbert_model_name_or_path, device=args.device)
+        
     processor = processors[task]()
         #(language=args.language, train_language=args.train_language)
     output_mode = output_modes[task]
     # Load data features from cache or dataset file
     cached_features_file = os.path.join(
         args.cache_dir,
-        "cached_{}_{}_{}_{}".format(
+        "cached_split={}_tokenizer={}_len={}_task={}_topk={}_sbert={}".format(
             "test" if evaluate else "train",
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
             str(args.max_seq_length),
             str(task),
-#             str(args.train_language if (not evaluate and args.train_language is not None) else args.language),
+            str(args.top_k),
+            str(sbert_model_name_or_path)
         ),
     )
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
@@ -370,6 +455,8 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
         features = wfc_convert_examples_to_features(
             examples,
             tokenizer,
+            sbert=sbert,
+            top_k=args.top_k,
             max_length=args.max_seq_length,
             label_list=label_list,
             output_mode=output_mode,
@@ -405,7 +492,22 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False):
 #     return list(dataset)
 
 
+################################################################################
+######## end CACHE FUNCTION ####################################################
+################################################################################
+
+
+
+
+################################################################################
+######## MAIN METHOD ###########################################################
+################################################################################
+
 def main():
+    
+    ############################################################################
+    ######## argument parser block #############################################
+
     parser = argparse.ArgumentParser()
 
     # Required parameters
@@ -453,7 +555,7 @@ def main():
     )
     parser.add_argument(
         "--cache_dir",
-        default='/sw/mcs/wfc',
+        default='/scratch/as9kc/wfc',
         type=str,
         help="Where do you want to store the pre-trained models downloaded from s3",
     )
@@ -499,7 +601,7 @@ def main():
     )
     parser.add_argument("--warmup_steps", default=0, type=int, help="Linear warmup over warmup_steps.")
 
-    parser.add_argument("--logging_steps", type=int, default=500, help="Log every X updates steps.")
+    parser.add_argument("--logging_steps", type=int, default=5, help="Log every X updates steps.")
     parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every X updates steps.")
     parser.add_argument(
         "--eval_all_checkpoints",
@@ -530,7 +632,11 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
 #     parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
 #     parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
+    parser.add_argument("--top_k", type=int, default=3, help='number of sentences to retrieve based on similarity with claim')
     args = parser.parse_args()
+    
+    ######## argument parser block #############################################
+    ############################################################################
 
     if (
         os.path.exists(args.output_dir)
@@ -543,15 +649,6 @@ def main():
                 args.output_dir
             )
         )
-
-    # Setup distant debugging if needed
-#     if args.server_ip and args.server_port:
-#         # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
-#         import ptvsd
-
-#         print("Waiting for debugger attach")
-#         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
-#         ptvsd.wait_for_attach()
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
@@ -575,6 +672,9 @@ def main():
         args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16,
     )
 
+    ############################################################################    
+    ######## auxilliary block ##################################################
+    
     # Set seed
     set_seed(args)
 
@@ -604,7 +704,7 @@ def main():
         cache_dir=args.cache_dir,
     )
 #     model = AutoModelForSequenceClassification.from_pretrained(
-    model = AutoModelForSequenceClassification.from_pretrained(
+    model = BertForFactChecking.from_pretrained(
         args.model_name_or_path,
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
@@ -618,10 +718,14 @@ def main():
 
     logger.info("Training/evaluation parameters %s", args)
 
+    
+    ############################################################################    
+    ######## action items ######################################################
+    
     # Training
     if args.do_train:
         train_dataset = load_and_cache_examples(args, args.task_name, tokenizer, evaluate=False)
-        global_step, tr_loss = train(args, train_dataset, model, tokenizer)
+        global_step, tr_loss = train(args, train_dataset, model, tokenizer, config=config)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
@@ -639,7 +743,7 @@ def main():
         torch.save(args, os.path.join(args.output_dir, "training_args.bin"))
 
         # Load a trained model and vocabulary that you have fine-tuned
-        model = AutoModelForSequenceClassification.from_pretrained(args.output_dir)
+        model = BertForFactChecking.from_pretrained(args.output_dir)
         tokenizer = AutoTokenizer.from_pretrained(args.output_dir)
         model.to(args.device)
 
@@ -657,7 +761,7 @@ def main():
             global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
             prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
 
-            model = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+            model = BertForFactChecking.from_pretrained(checkpoint)
             model.to(args.device)
             result = evaluate(args, model, tokenizer, prefix=prefix)
             result = dict((k + "_{}".format(global_step), v) for k, v in result.items())
