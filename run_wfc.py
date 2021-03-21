@@ -22,8 +22,9 @@ import pdb
 import argparse
 import glob
 import logging
-import os
+import os, sys
 import random
+import wandb
 
 import numpy as np
 import torch
@@ -43,7 +44,8 @@ from transformers import (
     #
 )
 from transformers import glue_convert_examples_to_features as convert_examples_to_features
-from transformers import xnli_compute_metrics as compute_metrics
+# from transformers import xnli_compute_metrics as compute_metrics
+from transformers import acc_and_f1 as compute_metrics
 # from transformers import xnli_output_modes as output_modes
 # from transformers import xnli_processors as processors
 
@@ -74,21 +76,22 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
+
 ################################################################################
 ######## begin TRAIN FUNCTION ##################################################
 ################################################################################
 def train(args, train_dataset, model, tokenizer, sbert=None, config=None):
     """ Train the model """
     if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter()
+        tb_writer = SummaryWriter(f'runs/{args.output_dir[len("out/"):]}')
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     #!
     ##############################
-    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=1 or args.train_batch_size)
+    train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
     ##############################
-    print("LEN train data", len([*train_dataloader]))
+    # print("LEN train data", len([*train_dataloader]))
 #     return None, None
         
     if args.max_steps > 0:
@@ -188,55 +191,40 @@ def train(args, train_dataset, model, tokenizer, sbert=None, config=None):
             if steps_trained_in_current_epoch > 0:
                 steps_trained_in_current_epoch -= 1
                 continue
-            #                                                         1, |E|, 768
+            #                                                         k, |E|, 768
             #print(f'{T.bold_yellow_on_black("INFO:")} batch length: {(batch[0].size())}\r', end='')
             
             #### TODO here for DEBUGGING purposes
             #if step >= 10: raise
-                
-            attentions = []
-            instance_outputs = []
-            hidden_states = []
-            instance_label = None
-            
-            running_logits = [] #torch.zeros(size=(1,2)).to(args.device)
-                
-            ######## batched loop
-#             minibatch_size = args.batch_size
-#             for j in range(0, batch[0].shape[1], minibatch_size):
-#                 limits = slice(j, min(j+minibatch_size, batch[0].shape[1]))
-                
-#                 print(f'batch contains: {[t.shape for t in batch]}')
-#                 minibatch = tuple(t[:, limits] for t in batch)
-            
-            #!!!!!!
-            minibatch = batch
-#                 print(f'{T.bold_yellow_on_black("Minibatch shape:")} {minibatch[0].shape}')
-
+                                
             model.train()
-            # batch = tuple(t.to(args.device) for t in batch) # contains *one* claim
+            batch = tuple(t.to(args.device) for t in batch) # contains *one* claim
 
-            labels = minibatch[3].view(-1, 1).to(args.device)
-            inputs = {"input_ids": minibatch[0].view(-1, 128).to(args.device), 
-                      "attention_mask": minibatch[1].view(-1, 128).to(args.device), 
-#                           "labels": labels,
-                     }
+            labels = batch[3].view(-1, 1)#.to(args.device)
+            instance_label = labels[0]
             
-            outputs = model(**inputs, output_hidden_states=True)
-            # b,2   b,1   12,b,n,768
-            logits, attn, hidden = outputs[:3] # model outputs are always tuple in transformers
+            inputs = {"input_ids": batch[0].view(-1, 128),#.to(args.device), 
+                      "attention_mask": batch[1].view(-1, 128),#.to(args.device), 
+                      # "labels": labels,
+                     }
+            # tb.add_graph(model, inputs)
+            
+            outputs = model(**inputs, output_hidden_states=False)
+            # k,2   k,1   12(k,n,768)
+            logits, attn, *hidden = outputs[:3] # model outputs are always tuple in transformers
             # CLS = hidden[-1][:, 0, :]
 
-            weighted = logits * attn.view(-1, 1)
-            logits = torch.sum(weighted, dim=0)
+            # !!!! 
+            weighted_logit = logits * attn.view(-1, 1)
+            # weighted_logit = logits * torch.softmax(torch.Tensor([-i for i in range(args.top_k)]).view(-1,1).to(args.device))
+            weighted_logit = torch.sum(weighted_logit, dim=0)
+            
+            
+            ####### ####### pdb.set_trace()
                 
-            instance_label = labels[0]
-                            
             loss_fct = torch.nn.functional.cross_entropy
-            loss = loss_fct(logits.view(-1, 2), instance_label.view(-1))
+            loss = loss_fct(weighted_logit.view(-1, 2), instance_label.view(-1))
     
-#             pdb.set_trace()
-                
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
             if args.gradient_accumulation_steps > 1:
@@ -250,6 +238,7 @@ def train(args, train_dataset, model, tokenizer, sbert=None, config=None):
 
             tr_loss += loss.item()
                 
+            # print(f'\nstep = {step}, global_step = {global_step}')
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if False or args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -269,9 +258,17 @@ def train(args, train_dataset, model, tokenizer, sbert=None, config=None):
                         results = evaluate(args, model, tokenizer)
                         for key, value in results.items():
                             tb_writer.add_scalar("eval_{}".format(key), value, global_step)
+                            wandb.log({f"eval_{key}": value}, commit=False)
+                            
                     tb_writer.add_scalar("lr", scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar("loss", (tr_loss - logging_loss) / args.logging_steps, global_step)
-                    logger.info("Train logging loss %.3f", (tr_loss - logging_loss) / args.logging_steps)
+                    
+                    wandb.log({"loss": (tr_loss - logging_loss) / args.logging_steps,
+                               "lr": scheduler.get_lr()[0]})
+                    
+                    
+                    logger.info("Train loss %.3f", (tr_loss - logging_loss) / args.logging_steps)
+                    logger.info("Step: %d, Global step: %d, t_total: %d", step, global_step, t_total)
                     logging_loss = tr_loss
                                        
 
@@ -330,7 +327,7 @@ def evaluate(args, model, tokenizer, prefix=""):
         args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
         # Note that DistributedSampler samples randomly
         eval_sampler = SequentialSampler(eval_dataset)
-        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=1 or args.eval_batch_size)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size)
 
         [*eval_dataloader]
 #         return {"None": None}
@@ -352,57 +349,59 @@ def evaluate(args, model, tokenizer, prefix=""):
             # batch = tuple(t.to(args.device) for t in batch)
 
             with torch.no_grad():
-                labels = batch[3].view(-1, 1).to(args.device); instance_label = labels[0]
+                
+                labels = batch[3].view(-1, 1).to(args.device)
+                instance_label = labels[0]
                 
                 inputs = {"input_ids": batch[0].view(-1, 128).to(args.device), 
                           "attention_mask": batch[1].view(-1, 128).to(args.device), 
 #                           "labels": batch[3].view(-1, 1).to(args.device),
                          }
-#                 if args.model_type != "distilbert":
-#                     inputs["token_type_ids"] = (
-#                         batch[2] if args.model_type in ["bert"] else None
-#                     )  # XLM and DistilBERT don't use segment_ids
-                outputs = model(**inputs, output_hidden_states=True)
                 
-#                 pdb.set_trace()
-                logits, attn, hidden = outputs[:3] # model outputs are always tuple in transformers (see doc)
-                CLS = hidden[-1][:, 0, :]
+                outputs = model(**inputs, output_hidden_states=False)
+
+                logits, attn, *hidden = outputs[:3] # model outputs are always tuple in transformers (see doc)
+                # CLS = hidden[-1][:, 0, :]
             
-                weighted = logits * (attn ).view(-1, 1)
-                logits = torch.sum(weighted, dim=0)
+                weighted_logit = logits * attn.view(-1, 1)
+                weighted_logit = torch.sum(weighted_logit, dim=0)
             
                 loss_fct = torch.nn.functional.cross_entropy
-                tmp_eval_loss = loss_fct(logits.view(-1, 2), instance_label.view(-1))
-
+                tmp_eval_loss = loss_fct(weighted_logit.view(-1, 2), instance_label.view(-1))
                 eval_loss = eval_loss + tmp_eval_loss.mean().item()
             nb_eval_steps += 1
             
-            
             if preds is None:
-                preds = logits.detach().cpu().view(1,-1).numpy()
+                preds = weighted_logit.detach().cpu().view(-1,2).numpy()
                 out_label_ids = labels.detach().cpu()[0].view(1,-1).numpy()
             else:
-                preds = np.append(preds, logits.detach().cpu().view(1,-1).numpy(), axis=0)
+                preds = np.append(preds, weighted_logit.detach().cpu().view(-1,2).numpy(), axis=0)
                 out_label_ids = np.append(out_label_ids, labels.detach().cpu()[0].view(1,-1).numpy(), axis=0)
 
-        pdb.set_trace()
+        #pdb.set_trace()
 
         eval_loss = eval_loss / nb_eval_steps
         if args.output_mode == "classification":
             preds = np.argmax(preds, axis=1)
         else:
             raise ValueError("No other `output_mode` for WFC-en.")
-        result = compute_metrics(eval_task, preds, out_label_ids)
+        
+        #pdb.set_trace()
+        
+        result = compute_metrics(preds, out_label_ids.reshape(-1))
         results.update(result)
+        results['loss'] = eval_loss
 
+        #pdb.set_trace()
+        
         output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
         with open(output_eval_file, "w") as writer:
             logger.info("***** Eval results {} *****".format(prefix))
-            for key in sorted(result.keys()):
-                logger.info("  %s = %s", key, str(result[key]))
-                writer.write("%s = %s\n" % (key, str(result[key])))
+            for key in sorted(results.keys()):
+                logger.info("  %s = %s", key, str(results[key]))
+                writer.write("%s = %s\n" % (key, str(results[key])))
 
-    pdb.set_trace()            
+    # pdb.set_trace()            
     
     return results
 
@@ -415,7 +414,8 @@ def evaluate(args, model, tokenizer, prefix=""):
 ################################################################################
 ######## begin CACHE FUNCTION ##################################################
 ################################################################################
-def load_and_cache_examples(args, task, tokenizer, evaluate=False, sbert_model_name_or_path:str=None):
+def load_and_cache_examples(args, task, tokenizer, evaluate=False, 
+                            sbert_model_name_or_path:str=None):
     '''
         sbert: string model name to pass to sentence_transformers.CrossEncoder
             this instance will be used to rank sentences in the evidence file by similarity
@@ -434,13 +434,14 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, sbert_model_n
     # Load data features from cache or dataset file
     cached_features_file = os.path.join(
         args.cache_dir,
-        "cached_split={}_tokenizer={}_len={}_task={}_topk={}_sbert={}".format(
+        "cached_split={}_tokenizer={}_len={}_task={}_topk={}_sbert={}_maxnum={}".format(
             "test" if evaluate else "train",
             list(filter(None, args.model_name_or_path.split("/"))).pop(),
             str(args.max_seq_length),
-            str(task),
+            str(task) + ('_context' if args.include_context else ''),
             str(args.top_k),
-            str(sbert_model_name_or_path)
+            str(sbert_model_name_or_path),
+            str(args.maxnum)
         ),
     )
     if os.path.exists(cached_features_file) and not args.overwrite_cache:
@@ -450,13 +451,18 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, sbert_model_n
         logger.info("Creating features from dataset file at %s", args.data_dir)
         label_list = processor.get_labels()
         examples = (
-            processor.get_test_examples(args.data_dir) if evaluate else processor.get_train_examples(args.data_dir)
+                                                      #####################################
+            processor.get_test_examples(args.data_dir, maxnum=2_700)          #############
+#             processor.get_test_examples(args.data_dir, maxnum=args.maxnum)    #############
+                                                      #####################################
+            if evaluate else processor.get_train_examples(args.data_dir, maxnum=args.maxnum)
         )
         features = wfc_convert_examples_to_features(
             examples,
             tokenizer,
             sbert=sbert,
             top_k=args.top_k,
+            include_context=args.include_context,
             max_length=args.max_seq_length,
             label_list=label_list,
             output_mode=output_mode,
@@ -525,16 +531,14 @@ def main():
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models",
     )
-#     parser.add_argument(
-#         "--language",
-#         default=None,
-#         type=str,
-#         required=True,
-#         help="Evaluation language. Also train language if `train_language` is set to None.",
-#     )
-#     parser.add_argument(
-#         "--train_language", default=None, type=str, help="Train language if is different of the evaluation language."
-#     )
+    parser.add_argument(
+        "--include_context",
+        action="store_true",
+        help="",
+    )
+    parser.add_argument(
+        "--train_language", default=None, type=str, help="Train language if is different of the evaluation language."
+    )
     parser.add_argument(
         "--output_dir",
         default='out',
@@ -566,24 +570,30 @@ def main():
         help="The maximum total input sequence length after tokenization. Sequences longer "
         "than this will be truncated, sequences shorter will be padded.",
     )
+    parser.add_argument(
+        "--maxnum",
+        default=None,
+        type=int,
+        help="The maximum number of examples to use for training.",
+    )
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_eval", action="store_true", help="Whether to run eval on the test set.")
     parser.add_argument(
-        "--evaluate_during_training", action="store_true", help="Rul evaluation during training at each logging step."
+        "--do_not_evaluate_during_training", action="store_true", help="Do not run evaluation during training at each logging step."
     )
     parser.add_argument(
         "--do_lower_case", default=True, help="(def. True) unset this using 'False' if using uncased model."
     )
 
-    parser.add_argument("--batch_size", default=8, type=int, help="Batch size")
-    parser.add_argument("--per_gpu_train_batch_size", default=8, type=int, help="Batch size per GPU/CPU for training.")
+    parser.add_argument("--batch_size", default=1, type=int, help="Batch size")
+    parser.add_argument("--per_gpu_train_batch_size", default=1, type=int, help="Batch size per GPU/CPU for training.")
     parser.add_argument(
-        "--per_gpu_eval_batch_size", default=8, type=int, help="Batch size per GPU/CPU for evaluation."
+        "--per_gpu_eval_batch_size", default=1, type=int, help="Batch size per GPU/CPU for evaluation."
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=4,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument("--learning_rate", default=5e-5, type=float, help="The initial learning rate for Adam.")
@@ -601,21 +611,22 @@ def main():
     )
     parser.add_argument("--warmup_steps", default=0, type=int, help="Linear warmup over warmup_steps.")
 
-    parser.add_argument("--logging_steps", type=int, default=5, help="Log every X updates steps.")
-    parser.add_argument("--save_steps", type=int, default=500, help="Save checkpoint every X updates steps.")
+    parser.add_argument("--logging_steps", type=int, default=50, help="Log every X updates steps.")
+    parser.add_argument("--save_steps", type=int, default=10_000, help="Save checkpoint every X updates steps.")
     parser.add_argument(
         "--eval_all_checkpoints",
         action="store_true",
         help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number",
     )
     parser.add_argument("--no_cuda", action="store_true", help="Avoid using CUDA when available")
+    parser.add_argument("--no_wandb", action="store_true", help="Avoid using WAndB")
     parser.add_argument(
         "--overwrite_output_dir", action="store_true", help="Overwrite the content of the output directory"
     )
     parser.add_argument(
         "--overwrite_cache", action="store_true", help="Overwrite the cached training and evaluation sets"
     )
-    parser.add_argument("--seed", type=int, default=42, help="random seed for initialization")
+    parser.add_argument("--seed", type=int, default=41, help="random seed for initialization")
 
     parser.add_argument(
         "--fp16",
@@ -638,6 +649,9 @@ def main():
     ######## argument parser block #############################################
     ############################################################################
 
+    args.output_dir += f'/top_k={args.top_k}; epochs={args.num_train_epochs}; lr={args.learning_rate}; bert={"_".join(args.model_name_or_path.split("/"))}; ' + \
+                       f'gradsteps={args.gradient_accumulation_steps}; ctx={args.include_context}; n={args.maxnum}'
+    
     if (
         os.path.exists(args.output_dir)
         and os.listdir(args.output_dir)
@@ -649,7 +663,13 @@ def main():
                 args.output_dir
             )
         )
-
+        
+    print('Must specify environment variable for:')
+    print('cuda visible devices:', os.environ['CUDA_VISIBLE_DEVICES'])
+    if os.environ['CUDA_VISIBLE_DEVICES'] not in list('0123'):
+        print('ERROR: parallelism disallowed')
+        exit()
+    
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
         device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
@@ -661,6 +681,8 @@ def main():
         args.n_gpu = 1
     args.device = device
 
+    args.evaluate_during_training = not args.do_not_evaluate_during_training
+    
     # Setup logging
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -671,7 +693,7 @@ def main():
         "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
         args.local_rank, device, args.n_gpu, bool(args.local_rank != -1), args.fp16,
     )
-
+    
     ############################################################################    
     ######## auxilliary block ##################################################
     
@@ -710,6 +732,24 @@ def main():
         config=config,
         cache_dir=args.cache_dir,
     )
+    
+    if not args.no_wandb:
+        wandb.init(project="wfc-2.3.5")
+    else:
+        wandb.init(project="wfc-scratchpad1")
+    wconfig = wandb.config
+    wandb.run.name += args.output_dir
+    
+    wconfig.learning_rate = args.learning_rate
+    wconfig.top_k = args.top_k
+    wconfig.epochs = args.num_train_epochs
+    wconfig.lr = args.learning_rate
+    wconfig.bert = args.model_name_or_path
+    wconfig.gradsteps = args.gradient_accumulation_steps 
+    wconfig.using_ctxt = args.include_context
+    wconfig.warmup = args.warmup_steps
+    
+    # wandb.watch(model, log='all')
 
     if args.local_rank == 0:
         torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
