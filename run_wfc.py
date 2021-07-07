@@ -253,7 +253,7 @@ def train(args, train_dataset, model, tokenizer, sbert=None, config=None):
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
                     if (
-                        args.local_rank == -1 and args.evaluate_during_training
+                        args.local_rank == -1 and args.evaluate_during_training and global_step % (2*args.logging_steps) == 0
                     ):  # Only evaluate when single GPU otherwise metrics may not average well
                         results = evaluate(args, model, tokenizer)
                         for key, value in results.items():
@@ -452,8 +452,8 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False,
         label_list = processor.get_labels()
         examples = (
                                                       #####################################
-            processor.get_test_examples(args.data_dir, maxnum=2_700)          #############
-#             processor.get_test_examples(args.data_dir, maxnum=args.maxnum)    #############
+#             processor.get_test_examples(args.data_dir, maxnum=2_700)          #############
+            processor.get_dev_examples(args.data_dir, maxnum=args.maxnum)    #############
                                                       #####################################
             if evaluate else processor.get_train_examples(args.data_dir, maxnum=args.maxnum)
         )
@@ -463,6 +463,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False,
             sbert=sbert,
             top_k=args.top_k,
             include_context=args.include_context,
+            levenshtein_only=args.levenshtein_only,
             max_length=args.max_seq_length,
             label_list=label_list,
             output_mode=output_mode,
@@ -533,6 +534,11 @@ def main():
     )
     parser.add_argument(
         "--include_context",
+        action="store_true",
+        help="",
+    )
+    parser.add_argument(
+        "--levenshtein_only",
         action="store_true",
         help="",
     )
@@ -650,7 +656,8 @@ def main():
     ############################################################################
 
     args.output_dir += f'/top_k={args.top_k}; epochs={args.num_train_epochs}; lr={args.learning_rate}; bert={"_".join(args.model_name_or_path.split("/"))}; ' + \
-                       f'gradsteps={args.gradient_accumulation_steps}; ctx={args.include_context}; n={args.maxnum}'
+                       f'gradsteps={args.gradient_accumulation_steps}; ' + \
+                       f'ctx={args.include_context}; ldonly={args.levenshtein_only}; n={args.maxnum}'
     
     if (
         os.path.exists(args.output_dir)
@@ -665,8 +672,10 @@ def main():
         )
         
     print('Must specify environment variable for:')
-    print('cuda visible devices:', os.environ['CUDA_VISIBLE_DEVICES'])
-    if os.environ['CUDA_VISIBLE_DEVICES'] not in list('0123'):
+    cuda_devs = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
+    print('cuda visible devices:', cuda_devs)
+    
+    if len(cuda_devs) in {0,4}:
         print('ERROR: parallelism disallowed')
         exit()
     
@@ -734,7 +743,7 @@ def main():
     )
     
     if not args.no_wandb:
-        wandb.init(project="wfc-2.3.5")
+        wandb.init(project="wfc-fever-dbg")
     else:
         wandb.init(project="wfc-scratchpad1")
     wconfig = wandb.config
@@ -747,6 +756,7 @@ def main():
     wconfig.bert = args.model_name_or_path
     wconfig.gradsteps = args.gradient_accumulation_steps 
     wconfig.using_ctxt = args.include_context
+    wconfig.levenshtein_only = args.levenshtein_only
     wconfig.warmup = args.warmup_steps
     
     # wandb.watch(model, log='all')
